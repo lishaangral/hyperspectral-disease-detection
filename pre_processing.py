@@ -19,9 +19,6 @@ Design goals:
 Dependencies (install via pip if not present):
   numpy, pandas, opencv-python, imageio, spectral, scipy, scikit-image, tqdm
 
-Usage:
-  import this module or run as script:
-    python preprocess_july2022.py --dataset /path/to/DATASET/July2022 --out /path/to/OUTPUT
 """
 
 from pathlib import Path

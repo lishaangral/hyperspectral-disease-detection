@@ -12,14 +12,14 @@ import zipfile
 from pathlib import Path
 from tqdm import tqdm   # progress bars
 
-# ---------------- CONFIG ----------------
+# CONFIG
 FILE_DOI = "doi:10.57745/XAZQ7O"   # File DOI for July 2022 ZIP (update from dataset page)
 SERVER = "https://entrepot.recherche.data.gouv.fr"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_DIR = PROJECT_ROOT / "DATASET"
 EXTRACT_DIR = DATASET_DIR / "July2022"
 
-# ---------------- FUNCTIONS ----------------
+# FUNCTIONS
 def download_file(file_doi: str, out_dir: Path) -> Path:
     """Download the July2022 ZIP from Dataverse API by file DOI with progress bar."""
     url = f"{SERVER}/api/access/datafile/:persistentId?persistentId={file_doi}"
