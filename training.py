@@ -1,320 +1,392 @@
+#!/usr/bin/env python3
 """
-3D-CNN + LSTM multi-head model for hyperspectral patch-sequence classification.
+Training script for 3D-CNN + LSTM hyperspectral early-detection model.
 
-This module defines a PyTorch model that:
-  - Encodes each spectral–spatial patch (S bands × H × W) with a 3D-CNN encoder
-    (spectral axis treated as depth/channel dimension for Conv3D).
-  - Applies a lightweight channel-attention (Squeeze-and-Excitation) after the encoder
-    to emphasize informative spectral–spatial channels.
-  - Aggregates per-time-step encoded vectors into a temporal sequence and feeds them
-    to a (Bi)LSTM to model progression across days.
-  - Provides multiple output heads:
-      * per-timestep 5-class classifier (healthy / pre_symp_disease / symp_disease /
-        pre_symp_water / symp_water)
-      * per-timestep anomaly score (sigmoid scalar) — useful for unsupervised cues
-      * sequence-level early-alert (sigmoid) — predicts whether the leaf will become
-        symptomatic within K days (learned from sequence)
-  - Is written for clarity / research iteration: modular blocks, sensible defaults,
-    and thorough docstring comments describing shapes and choices.
+This version uses an in-file configuration block (edit these variables directly)
+instead of CLI arguments. Edit the CONFIG section below and run:
 
-Design notes:
-  - Input expected from DataLoader `patch_collate()` in prior module:
-      batch = {
-        "seq": Tensor shape (B, T, 1, S, H, W)
-        "labels": (B, T) ...
-      }
-    We'll process the `seq` input: split or merge batch/time dims to run encoder.
-  - Encoder produces a fixed-size vector per time-step (encoder_feat_dim).
-  - LSTM is batch_first=True and returns per-timestep outputs which feed per-timestep heads.
-  - The sequence-level alert head uses attention-pooled LSTM outputs (learned temporal attention).
+    python train_hybrid.py
+
+Expectations:
+ - `dataset_sequence.py` provides PatchSequenceDataset and patch_collate.
+ - `model_hybrid.py` provides Hybrid3DConvLSTM.
+ - `labels_patches.csv` (output of labeler) exists and is prepared.
+ - Split your annotations into train/val CSVs beforehand (recommended) and point
+   TRAIN_ANNOTATIONS / VAL_ANNOTATIONS to those files.
+
+The training loop uses masked per-timestep cross-entropy and computes validation
+metrics including early-detection statistics. Adjust hyperparameters in the
+CONFIG block to experiment.
 """
 
-from typing import Optional, Tuple, Dict
+import os
+import json
+import math
+import time
+from pathlib import Path
+from typing import Dict, Any, Tuple, List
 
+import numpy as np
+import pandas as pd
+from sklearn.metrics import precision_recall_fscore_support
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
 
+# Project modules — adapt filenames/locations if you renamed files
+from dataset_sequence import PatchSequenceDataset, patch_collate
+from model_hybrid import Hybrid3DConvLSTM
 
-# Small utility blocks
-class SEBlock(nn.Module):
+# CONFIG (edit these values)
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+TRAIN_ANNOTATIONS = PROJECT_ROOT / "preproc" / "labels_patches_train.csv"   # <- set to your train CSV
+VAL_ANNOTATIONS = PROJECT_ROOT / "preproc" / "labels_patches_val.csv"       # <- set to your val CSV
+DATASET_ROOT = PROJECT_ROOT / "DATASET" / "July2022"                       # dataset root (day folders)
+OUT_DIR = PROJECT_ROOT / "runs" / "exp_manual_config"                       # where checkpoints & logs are saved
+
+# Data / patch settings
+PATCH_SIZE = 32
+BAND_MIN = 580.0
+BAND_MAX = 760.0
+CACHE_MODE = "memory"   # "none" | "memory" | "disk"
+CACHE_DIR = PROJECT_ROOT / "cache"    # used only if CACHE_MODE == "disk"
+MIN_MASK_COVERAGE = 0.6
+
+# Training hyperparameters
+EPOCHS = 60
+BATCH_SIZE = 8
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-5
+DEVICE = "cuda"      # or "cpu"
+NUM_WORKERS = 4
+
+# Model hyperparameters
+ENCODER_PARAMS = {"in_channels": 1, "encoder_dim": 256, "base_channels": 16}
+LSTM_HIDDEN = 128
+LSTM_LAYERS = 1
+BIDIRECTIONAL = True
+CLASSIFIER_HIDDEN = 128
+NUM_CLASSES = 5
+
+# Loss / optimization flags
+CLASS_WEIGHTS = None   # e.g. [1.0, 2.0, 5.0, 2.0, 3.0] or None
+USE_FOCAL = False
+FOCAL_GAMMA = 2.0
+MIXED_PRECISION = False
+
+# Checkpoint / scheduler
+SAVE_EVERY = 1    # save checkpoint every N epochs
+LR_SCHEDULER = True
+PATIENCE = 4
+
+# Misc
+SEED = 42
+PRINT_EVERY = 10
+
+# End CONFIG
+
+# Reproducibility
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+if CACHE_MODE == "disk":
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Utilities & Losses
+
+class MaskedCrossEntropy(nn.Module):
     """
-    Squeeze-and-Excitation block (channel attention).
-    Works on a 1D channel vector or on 3D conv channels. For our 3D conv output
-    we will treat the conv output as (N, C, D, H, W) and apply SE across C.
+    Cross-entropy applied per timestep with a boolean mask (True = include).
+    Expects predictions shape (B, T, C), targets shape (B, T) with label ints.
+    Mask is (B, T) boolean.
     """
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, weight: torch.Tensor = None):
         super().__init__()
-        self.fc1 = nn.Linear(channels, max(4, channels // reduction))
-        self.fc2 = nn.Linear(max(4, channels // reduction), channels)
+        self.ce = nn.CrossEntropyLoss(weight=weight, reduction="none")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, C, D, H, W) or (N, C)
-        if x.dim() == 5:
-            # global average pool spatial+spectral -> (N, C)
-            n, c, d, h, w = x.size()
-            y = x.mean(dim=[2, 3, 4])  # average over D,H,W
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor):
+        B, T, C = logits.shape
+        logits_flat = logits.reshape(B * T, C)
+        targets_flat = targets.reshape(B * T)
+        losses = self.ce(logits_flat, targets_flat)  # (B*T,)
+        losses = losses.reshape(B, T)
+        mask_f = mask.float()
+        denom = mask_f.sum()
+        if denom.item() == 0:
+            return logits.new_tensor(0.0), 0.0
+        loss = (losses * mask_f).sum() / denom
+        return loss, denom.item()
+
+
+def focal_loss_logits(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor,
+                      gamma: float = 2.0, weight=None):
+    """
+    Simple focal loss wrapper for multi-class logits with mask.
+    logits: (B,T,C), targets (B,T), mask (B,T)
+    """
+    ce = nn.CrossEntropyLoss(weight=weight, reduction="none")
+    B, T, C = logits.shape
+    logits_flat = logits.reshape(B * T, C)
+    targets_flat = targets.reshape(B * T)
+    losses = ce(logits_flat, targets_flat)  # (B*T,)
+    probs = torch.softmax(logits_flat, dim=-1)
+    pt = probs[torch.arange(probs.shape[0]), targets_flat]
+    focal = ((1 - pt) ** gamma) * losses
+    focal = focal.reshape(B, T)
+    mask_f = mask.float()
+    denom = mask_f.sum().clamp(min=1.0)
+    loss = (focal * mask_f).sum() / denom
+    return loss
+
+
+def compute_early_detection_metrics(batch_probs: np.ndarray, batch_labels: np.ndarray,
+                                    batch_label_mask: np.ndarray, seq_meta: List[Dict],
+                                    pre_symp_label_idxs=(1,), symp_label_idxs=(2,),
+                                    threshold: float = 0.5) -> Dict[str, Any]:
+    """
+    Lightweight early-detection metrics aggregated per-batch.
+    Uses sequence-level ground-truth symptom indices in meta or infers from labels.
+    Returns dict with avg_lead_time, detection_rate, etc.
+    """
+    B, T, C = batch_probs.shape
+    results = {"n_sequences": B, "n_detected_total": 0, "lead_times": [], "detection_offsets": [], "per_seq": []}
+
+    for i in range(B):
+        probs = batch_probs[i]
+        labels = batch_labels[i]
+        mask = batch_label_mask[i]
+        meta = seq_meta[i]
+        # infer first symptomatic index
+        fsd = meta.get("first_symptom_day", None)
+        if fsd is None:
+            symp_idxs = np.where((labels == 2) | (labels == 4))[0]
+            if symp_idxs.size == 0:
+                results["per_seq"].append({"detected": False, "reason": "no_gt_symptom"})
+                continue
+            fsd_idx = int(symp_idxs[0])
         else:
-            y = x
-        y = F.relu(self.fc1(y))
-        y = torch.sigmoid(self.fc2(y))
-        if x.dim() == 5:
-            # expand to multiply
-            y = y.view(n, c, 1, 1, 1)
-            return x * y
-        else:
-            return x * y
-
-
-class Conv3DBlock(nn.Module):
-    """
-    A small Conv3D -> BN -> ReLU block with optional spatial pooling.
-    Kernel shapes use (kernel_depth, kernel_h, kernel_w) so we can specify a
-    smaller spectral kernel vs spatial kernel if desired.
-    """
-    def __init__(self, in_ch: int, out_ch: int,
-                 kernel: Tuple[int, int, int] = (3, 3, 3),
-                 pool: Optional[Tuple[int, int, int]] = None):
-        super().__init__()
-        self.conv = nn.Conv3d(in_ch, out_ch, kernel_size=kernel, padding=tuple(k // 2 for k in kernel))
-        self.bn = nn.BatchNorm3d(out_ch)
-        self.act = nn.ReLU(inplace=True)
-        self.pool = nn.MaxPool3d(pool) if pool is not None else None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        if self.pool is not None:
-            x = self.pool(x)
-        return x
-
-
-# Main model
-class Encoder3D(nn.Module):
-    """
-    3D-CNN encoder for spectral-spatial patches.
-
-    Input (per time-step):  tensor shape (N, C=1, S, H, W)
-      - we treat spectral axis as spatial depth S for Conv3d.
-    Output: feature vector per sample: (N, encoder_dim)
-
-    Architecture (example / recommended):
-      - ConvBlock(1 -> 16, kernel=(3,3,3), pool=(1,2,2))  # keep spectral dim same, reduce spatial
-      - ConvBlock(16->32, kernel=(3,3,3), pool=(1,2,2))
-      - ConvBlock(32->64, kernel=(3,3,3), pool=(1,2,2))
-      - Global avg pool over (D,H,W) -> flatten -> linear -> encoder_dim
-      - SE block applied before pooling to reweight channels
-    """
-    def __init__(self, in_channels: int = 1, encoder_dim: int = 256, base_channels: int = 16):
-        super().__init__()
-        # three conv blocks with spatial pooling only (preserve spectral depth early)
-        self.block1 = Conv3DBlock(in_channels, base_channels, kernel=(3, 3, 3), pool=(1, 2, 2))
-        self.block2 = Conv3DBlock(base_channels, base_channels * 2, kernel=(3, 3, 3), pool=(1, 2, 2))
-        self.block3 = Conv3DBlock(base_channels * 2, base_channels * 4, kernel=(3, 3, 3), pool=(1, 2, 2))
-        self.se = SEBlock(base_channels * 4, reduction=8)
-        # after block3 the spatial dims are reduced by 2*2*2 = 8 in H/W if starting patch 32 -> 4
-        # We'll global average pool across spectral and spatial dims to get a channel vector
-        self.fc = nn.Linear(base_channels * 4, encoder_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (N, 1, S, H, W)
-        returns: (N, encoder_dim)
-        """
-        x = self.block1(x)   # -> (N, C1, S, H/2, W/2)
-        x = self.block2(x)   # -> (N, C2, S, H/4, W/4)
-        x = self.block3(x)   # -> (N, C3, S, H/8, W/8)
-        x = self.se(x)       # channel attention
-        # global average pool over spectral + spatial dims -> (N, C3)
-        x = x.mean(dim=[2, 3, 4])
-        x = self.fc(x)
-        x = F.relu(x)
-        return x
-
-
-class TemporalAttention(nn.Module):
-    """
-    Simple attention module over temporal LSTM outputs.
-    Input: H (N, T, hidden)
-    Output: context vector (N, hidden)
-    """
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.attn = nn.Linear(hidden_dim, 1)
-
-    def forward(self, h: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # h: (N, T, H)
-        scores = self.attn(h).squeeze(-1)  # (N, T)
-        if mask is not None:
-            scores = scores.masked_fill(~mask, float("-inf"))
-        weights = torch.softmax(scores, dim=-1)  # (N, T)
-        weights = weights.unsqueeze(-1)  # (N, T, 1)
-        context = (h * weights).sum(dim=1)  # (N, H)
-        return context, weights.squeeze(-1)
-
-
-class Hybrid3DConvLSTM(nn.Module):
-    """
-    Full model that combines:
-      - 3D-CNN encoder -> per-time-step features
-      - LSTM temporal module over sequence of features
-      - Multi-head outputs:
-          * per-timestep classifier (5-way)
-          * per-timestep anomaly (sigmoid)
-          * sequence-level early alert (sigmoid from attention-pooled LSTM)
-    """
-
-    def __init__(self,
-                 encoder_params: Dict = None,
-                 lstm_hidden: int = 256,
-                 lstm_layers: int = 1,
-                 bidirectional: bool = True,
-                 classifier_hidden: int = 128,
-                 num_classes: int = 5,
-                 dropout: float = 0.3,
-                 use_attention: bool = True):
-        super().__init__()
-        enc_p = encoder_params or {}
-        self.encoder = Encoder3D(**enc_p)  # default enc_p: in_channels=1, encoder_dim=256
-        enc_dim = enc_p.get("encoder_dim", 256)
-        self.lstm_hidden = lstm_hidden
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-
-        # LSTM temporal head: receives per-timestep encoder vectors
-        self.lstm = nn.LSTM(input_size=enc_dim,
-                            hidden_size=lstm_hidden,
-                            num_layers=lstm_layers,
-                            batch_first=True,
-                            bidirectional=bidirectional,
-                            dropout=dropout if lstm_layers > 1 else 0.0)
-
-        lstm_out_dim = lstm_hidden * self.num_directions
-
-        # Per-timestep classifier head -> applied to each timestep output of LSTM
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_out_dim, classifier_hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(classifier_hidden, num_classes)
-        )
-
-        # Per-timestep anomaly score head (single scalar)
-        self.anomaly_head = nn.Sequential(
-            nn.Linear(lstm_out_dim, classifier_hidden // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(classifier_hidden // 2, 1)
-        )
-
-        # Sequence-level alert: attention pool over time then small MLP -> sigmoid
-        self.use_attention = use_attention
-        if use_attention:
-            self.temporal_attention = TemporalAttention(lstm_out_dim)
-            self.alert_mlp = nn.Sequential(
-                nn.Linear(lstm_out_dim, lstm_out_dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-                nn.Linear(lstm_out_dim // 2, 1)
-            )
-        else:
-            # global pooling alternative
-            self.alert_mlp = nn.Sequential(
-                nn.Linear(lstm_out_dim, lstm_out_dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-                nn.Linear(lstm_out_dim // 2, 1)
-            )
-
-        # initialization helpers (optional)
-        self._init_weights()
-
-    def _init_weights(self):
-        # small init for linear layers (Xavier)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, seq: torch.Tensor, label_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass.
-
-        Args:
-          seq: input tensor shape (B, T, 1, S, H, W)
-          label_mask: optional bool tensor shape (B, T) indicating valid labelled timesteps;
-                      used by attention to ignore padded/missing steps.
-
-        Returns a dict with:
-          'logits': (B, T, num_classes)  -- raw logits for per-timestep classification
-          'probs': (B, T, num_classes)   -- softmax probabilities
-          'anomaly_logits': (B, T, 1)    -- raw scalar for anomaly
-          'anomaly_probs': (B, T, 1)     -- sigmoid anomaly scores
-          'alert_logit': (B, 1)          -- sequence-level alert logit
-          'alert_prob': (B, 1)           -- sequence-level alert probability
-          'lstm_outputs': (B, T, lstm_out_dim) internal for debugging/auxiliary use
-        """
-        B, T, C, S, H, W = seq.shape
-        # Merge batch and time dims to run encoder efficiently
-        x = seq.view(B * T, C, S, H, W)  # (B*T, 1, S, H, W)
-        # pass through encoder: returns (B*T, enc_dim)
-        enc = self.encoder(x)  # (B*T, enc_dim)
-        # reshape back to sequence form
-        enc_seq = enc.view(B, T, -1)  # (B, T, enc_dim)
-
-        # LSTM expects (B, T, enc_dim) when batch_first=True
-        lstm_out, _ = self.lstm(enc_seq)  # lstm_out: (B, T, lstm_out_dim)
-        # Per-timestep classification & anomaly
-        logits = self.classifier(lstm_out)  # (B, T, num_classes)
-        probs = torch.softmax(logits, dim=-1)
-        anomaly_logits = self.anomaly_head(lstm_out)  # (B, T, 1)
-        anomaly_probs = torch.sigmoid(anomaly_logits)
-
-        # Sequence-level alert
-        if self.use_attention:
-            # create boolean mask for attention: True where label_mask True; if None use all True
-            if label_mask is not None:
-                attn_mask = label_mask  # (B, T) boolean
+            days = meta.get("days", None)
+            if days and fsd in days:
+                fsd_idx = days.index(fsd)
             else:
-                attn_mask = torch.ones((B, T), dtype=torch.bool, device=seq.device)
-            context, attn_weights = self.temporal_attention(lstm_out, mask=attn_mask)
-            alert_logit = self.alert_mlp(context).squeeze(-1)  # (B,)
+                fsd_idx = int(fsd)
+
+        idxs = list(pre_symp_label_idxs) + list(symp_label_idxs)
+        agg_series = probs[:, idxs].sum(axis=1)
+        detected_idxs = np.where(agg_series >= threshold)[0]
+        if detected_idxs.size == 0:
+            results["per_seq"].append({"detected": False, "fsd_idx": fsd_idx})
+            continue
+        det_idx = int(detected_idxs[0])
+        lead = fsd_idx - det_idx
+        offset = det_idx - fsd_idx
+        results["n_detected_total"] += 1
+        results["lead_times"].append(lead)
+        results["detection_offsets"].append(offset)
+        results["per_seq"].append({"detected": True, "det_idx": det_idx, "fsd_idx": fsd_idx, "lead": lead})
+
+    if results["lead_times"]:
+        results["avg_lead_time"] = float(np.mean(results["lead_times"]))
+        results["median_lead_time"] = float(np.median(results["lead_times"]))
+    else:
+        results["avg_lead_time"] = None
+        results["median_lead_time"] = None
+    results["detection_rate"] = results["n_detected_total"] / max(1, results["n_sequences"])
+    return results
+
+
+# Train / Validation loops
+
+def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: optim.Optimizer,
+                device: torch.device, loss_fn: MaskedCrossEntropy, epoch: int,
+                use_focal: bool = False, focal_gamma: float = 2.0, scaler=None):
+    model.train()
+    total_loss = 0.0
+    total_examples = 0
+    for batch_idx, batch in enumerate(dataloader, start=1):
+        seq = batch["seq"].to(device)
+        labels = batch["labels"].to(device)
+        mask = batch["label_mask"].to(device)
+        optimizer.zero_grad()
+
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                outputs = model(seq, label_mask=mask)
+                logits = outputs["logits"]
+                if use_focal:
+                    loss = focal_loss_logits(logits, labels, mask, gamma=focal_gamma)
+                else:
+                    loss, denom = loss_fn(logits, labels, mask)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            # simple mean pooling over time (only valid timesteps)
-            if label_mask is not None:
-                # replace masked positions with 0 and average by count
-                maskf = label_mask.float().unsqueeze(-1)
-                summed = (lstm_out * maskf).sum(dim=1)
-                denom = maskf.sum(dim=1).clamp(min=1.0)
-                pooled = summed / denom
+            outputs = model(seq, label_mask=mask)
+            logits = outputs["logits"]
+            if use_focal:
+                loss = focal_loss_logits(logits, labels, mask, gamma=focal_gamma)
             else:
-                pooled = lstm_out.mean(dim=1)
-            alert_logit = self.alert_mlp(pooled).squeeze(-1)  # (B,)
+                loss, denom = loss_fn(logits, labels, mask)
+            loss.backward()
+            optimizer.step()
 
-        alert_prob = torch.sigmoid(alert_logit).unsqueeze(-1)  # (B, 1)
-        alert_logit = alert_logit.unsqueeze(-1)
+        batch_n = seq.shape[0]
+        total_loss += float(loss.item()) * batch_n
+        total_examples += batch_n
+        if (batch_idx % PRINT_EVERY) == 0:
+            print(f"[Train] Epoch {epoch}  batch {batch_idx}/{len(dataloader)}  loss={loss.item():.4f}")
 
-        return {
-            "logits": logits,                     # (B, T, num_classes)
-            "probs": probs,                       # (B, T, num_classes)
-            "anomaly_logits": anomaly_logits,     # (B, T, 1)
-            "anomaly_probs": anomaly_probs,       # (B, T, 1)
-            "alert_logit": alert_logit,           # (B, 1)
-            "alert_prob": alert_prob,             # (B, 1)
-            "lstm_outputs": lstm_out              # (B, T, lstm_out_dim)
-        }
+    avg_loss = total_loss / max(1, total_examples)
+    print(f"[Train] Epoch {epoch}: avg_loss={avg_loss:.4f}")
+    return avg_loss
 
 
-# Example quick test (not executed here)
+def validate_epoch(model: nn.Module, dataloader: DataLoader, device: torch.device,
+                   epoch: int, threshold: float = 0.5):
+    model.eval()
+    all_logits = []
+    all_labels = []
+    all_masks = []
+    metas = []
+    with torch.no_grad():
+        for batch in dataloader:
+            seq = batch["seq"].to(device)
+            labels = batch["labels"].to(device)
+            mask = batch["label_mask"].to(device)
+            outputs = model(seq, label_mask=mask)
+            logits = outputs["logits"].cpu().numpy()
+            probs = outputs["probs"].cpu().numpy()
+            all_logits.append(logits)
+            all_labels.append(labels.cpu().numpy())
+            all_masks.append(mask.cpu().numpy())
+            metas.extend(batch["meta"])
+
+    if not all_logits:
+        return {}
+
+    all_logits = np.concatenate(all_logits, axis=0)    # (N, T, C)
+    all_probs = np.concatenate([np.exp(l) / np.exp(l).sum(axis=-1, keepdims=True) for l in all_logits], axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)    # (N, T)
+    all_masks = np.concatenate(all_masks, axis=0)      # (N, T)
+
+    # Flatten per-timestep for classification metrics using masked entries
+    flat_preds = []
+    flat_targets = []
+    for i in range(all_labels.shape[0]):
+        for t in range(all_labels.shape[1]):
+            if all_masks[i, t]:
+                probs_t = all_probs[i, t]
+                pred_cls = int(np.argmax(probs_t))
+                flat_preds.append(pred_cls)
+                flat_targets.append(int(all_labels[i, t]))
+
+    if len(flat_targets) == 0:
+        print("[Val] No labeled timesteps found in validation set.")
+        return {}
+
+    labels_unique = sorted(list(set(flat_targets)))
+    p, r, f, _ = precision_recall_fscore_support(flat_targets, flat_preds, labels=labels_unique, zero_division=0)
+    stats = {"per_class": {}}
+    for lab, pp, rr, ff in zip(labels_unique, p, r, f):
+        stats["per_class"][str(lab)] = {"precision": float(pp), "recall": float(rr), "f1": float(ff)}
+    stats["macro_f1"] = float(np.mean(f))
+    print(f"[Val] Epoch {epoch} macro_f1={stats['macro_f1']:.4f}")
+
+    # Early-detection metrics (sequence-level)
+    early = compute_early_detection_metrics(all_probs, all_labels, all_masks, metas, threshold=threshold)
+    stats["early_detection"] = early
+    return stats
+
+
+# Main orchestration
+
+def main():
+    device = torch.device(DEVICE if torch.cuda.is_available() and DEVICE.startswith("cuda") else "cpu")
+    print(f"[INFO] Using device: {device}")
+
+    # Load datasets (assumes train/val CSVs exist). If you have only one CSV, split by plant_id manually first.
+    if not TRAIN_ANNOTATIONS.exists():
+        raise SystemExit(f"[ERROR] Train annotations not found: {TRAIN_ANNOTATIONS}")
+    if not VAL_ANNOTATIONS.exists():
+        print(f"[WARN] Val annotations not found: {VAL_ANNOTATIONS} -- using train CSV for validation (NOT recommended).")
+    train_ds = PatchSequenceDataset(annotations_csv=str(TRAIN_ANNOTATIONS),
+                                    dataset_root=str(DATASET_ROOT),
+                                    patch_size=PATCH_SIZE,
+                                    band_min=BAND_MIN,
+                                    band_max=BAND_MAX,
+                                    normalize_stats=None,
+                                    cache_mode=CACHE_MODE,
+                                    cache_dir=str(CACHE_DIR) if CACHE_MODE == "disk" else None,
+                                    min_mask_coverage=MIN_MASK_COVERAGE)
+    val_ds = PatchSequenceDataset(annotations_csv=str(VAL_ANNOTATIONS if VAL_ANNOTATIONS.exists() else TRAIN_ANNOTATIONS),
+                                  dataset_root=str(DATASET_ROOT),
+                                  patch_size=PATCH_SIZE,
+                                  band_min=BAND_MIN,
+                                  band_max=BAND_MAX,
+                                  normalize_stats=None,
+                                  cache_mode="none",
+                                  cache_dir=None,
+                                  min_mask_coverage=MIN_MASK_COVERAGE)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              collate_fn=patch_collate, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            collate_fn=patch_collate, num_workers=max(1, NUM_WORKERS // 2))
+
+    # Model
+    model = Hybrid3DConvLSTM(encoder_params=ENCODER_PARAMS,
+                             lstm_hidden=LSTM_HIDDEN,
+                             lstm_layers=LSTM_LAYERS,
+                             bidirectional=BIDIRECTIONAL,
+                             classifier_hidden=CLASSIFIER_HIDDEN,
+                             num_classes=NUM_CLASSES)
+    model.to(device)
+
+    # Loss & optimizer
+    class_weights_tensor = None
+    if CLASS_WEIGHTS is not None:
+        class_weights_tensor = torch.tensor(CLASS_WEIGHTS, dtype=torch.float32, device=device)
+    loss_fn = MaskedCrossEntropy(weight=class_weights_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "max", patience=PATIENCE, factor=0.5) if LR_SCHEDULER else None
+
+    scaler = torch.cuda.amp.GradScaler() if (MIXED_PRECISION and device.type == "cuda") else None
+
+    best_val = -math.inf
+    best_ckpt = None
+
+    for epoch in range(1, EPOCHS + 1):
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, device, loss_fn, epoch,
+                                 use_focal=USE_FOCAL, focal_gamma=FOCAL_GAMMA, scaler=scaler)
+        val_stats = validate_epoch(model, val_loader, device, epoch=epoch, threshold=0.5)
+        metric = val_stats.get("macro_f1", 0.0) if val_stats else 0.0
+        if scheduler is not None:
+            scheduler.step(metric)
+
+        # Save checkpoint
+        if (epoch % SAVE_EVERY) == 0:
+            ckpt = {"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "val_stats": val_stats}
+            ckpt_path = OUT_DIR / f"ckpt_epoch_{epoch:03d}.pth"
+            torch.save(ckpt, ckpt_path)
+            print(f"[SAVE] Checkpoint -> {ckpt_path}")
+
+        # Track best
+        if metric > best_val:
+            best_val = metric
+            best_ckpt = OUT_DIR / "best_model.pth"
+            torch.save({"epoch": epoch, "model_state": model.state_dict(), "val_stats": val_stats}, best_ckpt)
+            print(f"[BEST] New best model at epoch {epoch}: macro_f1={metric:.4f}")
+
+        t1 = time.time()
+        print(f"[EPOCH] {epoch} finished in {t1 - t0:.1f}s\n")
+
+    print(f"[DONE] Training complete. Best checkpoint: {best_ckpt}")
+
+
 if __name__ == "__main__":
-    # quick sanity check on tensor shapes (toy run)
-    B, T, C, S, H, W = 2, 5, 1, 32, 32, 32
-    toy_in = torch.randn(B, T, C, S, H, W)
-    model = Hybrid3DConvLSTM(encoder_params={"in_channels": 1, "encoder_dim": 256, "base_channels": 16},
-                             lstm_hidden=128, lstm_layers=1, bidirectional=True, classifier_hidden=128)
-    out = model(toy_in)  # label_mask omitted for simple test
-    for k, v in out.items():
-        if isinstance(v, torch.Tensor):
-            print(k, v.shape)
+    main()
