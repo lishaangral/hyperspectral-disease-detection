@@ -18,14 +18,14 @@ default bands = {
 }
 latitude = 0.00000000
 longitude = 0.00000000
-acquisition date = 13-07-2022
+acquisition date = 25-07-2022
 errors = none
 binning = {
 1,
 1
 }
-tint = 22
-fps = 45.4545
+tint = 18
+fps = 55.5556
 wavelength = {
 397.32,
 400.20,
